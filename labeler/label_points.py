@@ -469,6 +469,10 @@ class LabelerWindow(QtGui.QWidget):
 if __name__ == '__main__':
     app = QApplication([])
     win = LabelerWindow()
+
+    #URLS:   https://drive.google.com/open?id=0B8AGWB7NYzjXQjhkVm9iWFlUaU0
+    #URLS:   https://drive.google.com/open?id=0B8AGWB7NYzjXQk5NTS1ibFJYM3c
+
     win.open(r'D:\sf_building_footprints\201104_san_francisco_ca_0x3000m_utm_clr\north_up\10seg460805.tif')
     win.goto_next_uncertain()
     win.show()
