@@ -1,29 +1,21 @@
-import hashlib
 import os
-import pickle
 from math import sqrt, exp, ceil, floor
 import gdal
-import h5py
 import numpy
+import pickle
 from PIL import Image
 from PIL.ImageQt import ImageQt
 from PyQt4 import QtGui
 from PyQt4.Qt import Qt
 from PyQt4.QtGui import QApplication, QPen
-from skimage.filters import sobel
 from skimage.transform import rotate
+from labeler.dataset import DataSet
 
-def _create_name(sample):
-    name = hashlib.md5(sample.flatten()).hexdigest()[:8]
-    return name
 
 class Classifier:
-    def __init__(self, label, shape, filename='truth'):
+    def __init__(self, label, shape):
         self.label = label
         self.shape = shape
-        if not filename.endswith('h5'):
-            filename += '.h5'
-
         self.positives = []
         self.negatives = []
         self.rbf = lambda x: exp(-x**2)
@@ -41,31 +33,13 @@ class Classifier:
         self.transforms.append(lambda x: x[:, ::-1, :])
         self.transforms.append(lambda x: x + numpy.random.randn(*x.shape)*0.1)
         self.transforms.append(lambda x: x)
+        self.filename = 'truth.pkl'
 
-        if not os.path.exists(filename):
-            self.file = h5py.File(filename, 'w')
-        else:
-            self.file = h5py.File(filename, 'r+')
-        self.grp_context = self.file.require_group('{}x{}'.format(self.shape[0], self.shape[1]))
-        self.grp_label = self.grp_context.require_group('{}'.format(self.label))
-        self.grp_positives = self.grp_label.require_group('positive')
-        self.grp_negatives = self.grp_label.require_group('negative')
-
-    def __hd5_set_image(self, dset):
-        dset.attrs['CLASS'] = 'IMAGE'
-        dset.attrs['IMAGE_VERSION'] = '1.2'
-        dset.attrs['IMAGE_SUBCLASS'] =  'IMAGE_TRUECOLOR'
-        dset.attrs['INTERLACE_MODE'] = 'INTERLACE_PLANE'
-
-    def save_positive(self, sample):
-        ds = self.grp_positives.create_dataset(_create_name(sample), data=sample)
-        self.__hd5_set_image(ds)
-        self.file.flush()
-
-    def save_negative(self, sample):
-        ds = self.grp_negatives.create_dataset(_create_name(sample), data=sample)
-        self.__hd5_set_image(ds)
-        self.file.flush()
+    def rebuild(self, dataset):
+        for s in dataset.labeled('positive'):
+            self.add_positive(s.data)
+        for s in dataset.labeled('negative'):
+            self.add_negative(s.data)
 
     def sample_width(self):
         return self.shape[0]
@@ -74,13 +48,13 @@ class Classifier:
         return self.shape[1]
 
     def rbf(self, r):
-        return exp(-abs(r)**2)
+        return 1./(abs(r)+1)
 
     def extract_features(self, sample):
         return sample.flatten()
 
     def compare(self, query, sample):
-        diff = numpy.linalg.norm(query - sample)
+        diff = numpy.linalg.norm(query - sample)/len(query)
         weight = self.rbf(diff)
         return weight
 
@@ -88,21 +62,24 @@ class Classifier:
         if transforms is None: transforms = self.transforms
         for t in transforms:
             self.negatives.append(t(sample))
-        self.save_negative(sample)
 
     def add_positive(self, sample, transforms=None):
         if transforms is None: transforms = self.transforms
         for t in transforms:
             self.positives.append(t(sample))
-        self.save_positive(sample)
 
-    def save(self, file):
+    def save(self, file=None):
+        if file is None:
+            file = open(self.filename, 'w')
         pickle.dump(dict(positives=self.positives, negatives=self.negatives), file)
+        file.close()
+        self.filename = file.name
 
     def update(self, file):
         data = pickle.load(file)
         self.positives += data['positives']
         self.negatives += data['negatives']
+        self.filename = file.name
 
     def clear(self):
         self.positives = []
@@ -112,6 +89,7 @@ class Classifier:
         self.clear()
         self.update(file)
         self.info()
+        self.filename = file.name
 
     def find_similar_positive(self, sample):
         w_p = -1e16
@@ -149,7 +127,6 @@ class Classifier:
         for i, s in enumerate(samples):
             w = self.classify(s)
             w += numpy.random.randn()*0.001
-            print "testing-", w
             if abs(w-0.5) < abs(least_certain-0.5):
                 least_certain = w
                 least_certain_index = i
@@ -162,19 +139,27 @@ class Classifier:
 
 
 
-classifier = Classifier('cars', (30, 30))
+
 
 undos = []
-
 
 MODE_POSITIVES = 'P'
 MODE_NEGATIVES = 'N'
 MODE_UNCERTAIN = 'U'
 
 class LabelerWindow(QtGui.QWidget):
-    def __init__(self):
+    def __init__(self, truth='truth', width=30, height=30, classifier = None):
         super(LabelerWindow, self).__init__()
-        self.ds = None
+
+        self.dataset = DataSet(truth, width, height)
+        """ The ground truth images
+        :type: labeler.dataset.DataSet
+        """
+
+        self.classifier = classifier or Classifier('cars', (width, height))
+        """ The classifier we are building"""
+
+        self.raster = None
         """The GDAL dataset we are viewing.
         :type ds: gdal.Dataset
         """
@@ -193,19 +178,29 @@ class LabelerWindow(QtGui.QWidget):
         :type buffer: numpy.ndarray
         """
 
+        self.random_walk = True
+        """ Whether to look for the next sample within the current window (True) or within the entire raster (False)
+        :type: Boolean
+        """
+
         self.mode = MODE_POSITIVES
 
-    def open(self, datasource):
-        """Load a dataset to display it in this window
+    def open_raster(self, datasource):
+        """Load a raster dataset to display it in this window.
+
+        This can be a single GeoTIFF (or other GDAL file) or a VRT file that mosaics several rasters.
+
+        :param datasource: The GDAL datasource, or a description (filename)
+        :type datasource: str | gdal.DataSet
         """
 
         if isinstance(datasource, gdal.Dataset):
-            self.ds = datasource
+            self.raster = datasource
         else:
-            self.ds = gdal.Open(datasource)
+            self.raster = gdal.Open(datasource)
 
     def visible_region(self, geo_x=None, geo_y=None, width=None, height=None, scale=None):
-        if self.ds is None: return
+        if self.raster is None: return
         if geo_x is None: geo_x = self.geo_x
         if geo_y is None: geo_y = self.geo_y
         if width is None: width = self.width()
@@ -214,7 +209,7 @@ class LabelerWindow(QtGui.QWidget):
 
         assert geo_x is not None and geo_y is not None
 
-        geo_transform = self.ds.GetGeoTransform()   # col, row --->  lon, lat
+        geo_transform = self.raster.GetGeoTransform()   # col, row --->  lon, lat
         ok, inverse_geo_transform = gdal.InvGeoTransform(geo_transform)  # lon, lat --->  col, row
         col, row = gdal.ApplyGeoTransform(inverse_geo_transform, self.geo_x, self.geo_y)
 
@@ -234,21 +229,21 @@ class LabelerWindow(QtGui.QWidget):
         return x_off, y_off, x_size, y_size
 
     def load_buffer(self, geo_x=None, geo_y=None, width=None, height=None, scale=None):
-        if self.ds is None: return
+        if self.raster is None: return
         x_off, y_off, x_size, y_size = self.visible_region(geo_x, geo_y, width, height, scale)
 
         # Load the data (gdal may keep it cached / memory mapped for us)
         clipped_x = max(0, -x_off)
         clipped_y = max(0, -y_off)
-        clipped_xmax = min(self.ds.RasterXSize, x_off + x_size)
-        clipped_ymax = min(self.ds.RasterYSize, y_off + y_size)
+        clipped_xmax = min(self.raster.RasterXSize, x_off + x_size)
+        clipped_ymax = min(self.raster.RasterYSize, y_off + y_size)
         clipped_width = clipped_xmax - clipped_x - x_off
         clipped_height = clipped_ymax - clipped_y - y_off
 
         if clipped_width < 0 or clipped_height < 0 or clipped_x >= x_size or clipped_y >= y_size:
-            return numpy.zeros((y_size, x_size, self.ds.RasterCount), dtype=numpy.uint8)
+            return numpy.zeros((y_size, x_size, self.raster.RasterCount), dtype=numpy.uint8)
 
-        data = self.ds.ReadAsArray(x_off+clipped_x, y_off+clipped_y, clipped_width, clipped_height) \
+        data = self.raster.ReadAsArray(x_off + clipped_x, y_off + clipped_y, clipped_width, clipped_height) \
 
         # Convert data into visible representation
         data = data.transpose(1, 2, 0)
@@ -258,15 +253,15 @@ class LabelerWindow(QtGui.QWidget):
             data = data.astype(numpy.uint8)
 
         if not data.shape[:2] == (y_size, x_size):
-            padding = numpy.zeros((y_size, x_size, self.ds.RasterCount), dtype=numpy.uint8)
+            padding = numpy.zeros((y_size, x_size, self.raster.RasterCount), dtype=numpy.uint8)
             padding[clipped_y:clipped_y+clipped_height, clipped_x:clipped_x+clipped_width, :] = data
             data = padding
 
         return data
 
-    def geo_center(self):
-        geo_transform = self.ds.GetGeoTransform()   # col, row --->  lon, lat
-        x, y = gdal.ApplyGeoTransform(geo_transform, self.ds.RasterXSize/2, self.ds.RasterYSize/2)
+    def center_of_raster(self):
+        geo_transform = self.raster.GetGeoTransform()   # col, row --->  lon, lat
+        x, y = gdal.ApplyGeoTransform(geo_transform, self.raster.RasterXSize / 2, self.raster.RasterYSize / 2)
         return x, y
 
     def look_at(self, geo_x, geo_y, scale=None):
@@ -282,10 +277,25 @@ class LabelerWindow(QtGui.QWidget):
         y = ry + rh*y/self.height()
         return x, y
 
+    def raster_to_window(self, x, y):
+        rx, ry, rw, rh = self.visible_region()
+        x = -rx + x*self.width()/rw
+        y = -ry + y*self.height()/rh
+        return x, y
+
     def raster_to_geo(self, x, y):
-        geo_transform = self.ds.GetGeoTransform()   # col, row --->  lon, lat
+        geo_transform = self.raster.GetGeoTransform()   # col, row --->  lon, lat
         x, y = gdal.ApplyGeoTransform(geo_transform, x, y)
         return x, y
+
+    def geo_to_raster(self, x, y):
+        geo_transform = self.raster.GetGeoTransform()   # col, row --->  lon, lat
+        inv_transform = gdal.InvGeoTransform(geo_transform)
+        x, y = gdal.ApplyGeoTransform(inv_transform, x, y)
+        return x, y
+
+    def geo_to_window(self, x, y):
+        return self.raster_to_window(self.geo_to_raster(x, y))
 
     def window_to_geo(self, x, y):
         return self.raster_to_geo(*self.window_to_raster(x,y))
@@ -293,6 +303,14 @@ class LabelerWindow(QtGui.QWidget):
     def update_raster(self):
         self.buffer = self.load_buffer()
         self.update()
+
+    def load_classifier(self):
+        try:
+            if os.path.exists('training.pkl'):
+                with open('training.pkl', 'rb') as f:
+                    self.classifier.load(f)
+        except:
+            self.classifier.rebuild(self.dataset)
 
     def paintEvent(self, QPaintEvent):
         super(LabelerWindow, self).paintEvent(QPaintEvent)
@@ -324,9 +342,11 @@ class LabelerWindow(QtGui.QWidget):
         self.update_raster()
 
     def get_sample(self):
-        s = self.load_buffer(width=classifier.sample_width(), height=classifier.sample_height(),
-                             scale=0.25).astype(float)/255.0
+        s = self.load_buffer(width=self.dataset.width, height=self.dataset.height, scale=0.25).astype(float)/255.0
         return s
+
+    def geo_xy(self):
+        return self.geo_x, self.geo_y
 
     def goto_next_sample(self):
         if self.mode == MODE_POSITIVES:
@@ -337,10 +357,32 @@ class LabelerWindow(QtGui.QWidget):
             self.goto_next_uncertain()
 
     def get_random_xys(self, n):
-        width, height = classifier.sample_width(), classifier.sample_height()
-        x = numpy.random.random_integers(int(ceil(width/2)), int(floor(self.ds.RasterXSize-width/2)), 100)
-        y = numpy.random.random_integers(int(ceil(height/2)), int(floor(self.ds.RasterYSize-height/2)), 100)
+        if self.random_walk:
+            return self.get_random_in_view(n)
+        else:
+            return self.get_random_in_raster(n)
+
+    def get_random_in_raster(self, n):
+        width, height = self.classifier.shape
+        x = numpy.random.random_integers(int(ceil(width/2)), int(floor(self.raster.RasterXSize - width / 2)), n)
+        y = numpy.random.random_integers(int(ceil(height/2)), int(floor(self.raster.RasterYSize - height / 2)), n)
+
         return zip(x, y)
+
+    def get_random_in_view(self, n):
+        x0, y0, w, h = self.visible_region()
+        x1, y1 = x0+w, y0+h
+        width, height = self.classifier.shape
+        rx, ry = width / 2, height/2
+        x0 = int(ceil(max(x0, rx)))
+        y0 = int(ceil(max(y0, ry)))
+        x1 = int(floor(min(self.raster.RasterXSize-rx, x1)))
+        y1 = int(floor(min(self.raster.RasterYSize-ry, y1)))
+        x = numpy.random.random_integers(x0, x1, n)
+        y = numpy.random.random_integers(y0, y1, n)
+        return zip(x, y)
+
+
 
     def goto_next_uncertain(self):
         x, y = zip(*self.get_random_xys(100))
@@ -349,25 +391,31 @@ class LabelerWindow(QtGui.QWidget):
             self.look_at(*self.raster_to_geo(x[i], y[i]))
             s = self.get_sample()
             samples.append(s)
-        i, w = classifier.find_least_certain(samples)
+        i, w = self.classifier.find_least_certain(samples)
 
         print "Least confident:", w
         self.look_at(*self.raster_to_geo(x[i], y[i]))
 
-    def goto_next_positive(self, thresh=0.5):
+    def goto_next_positive(self, thresh=-1):
+        best = -1
+        best_x, best_y = self.geo_x, self.geo_y
+
         for i, (x, y) in enumerate(self.get_random_xys(100)):
             self.look_at(*self.raster_to_geo(x, y))
             s = self.get_sample()
-            w = classifier.classify(s)
+            w = self.classifier.classify(s)
             if w > thresh:
-                print "Positive sample", w
-                break
+                best = i
+                best_x, best_y = x, y
+                thresh = w
+        self.look_at(*self.raster_to_geo(best_x, best_y))
+
 
     def goto_next_negative(self, thresh=0.5):
         for i, (x, y) in enumerate(self.get_random_xys(100)):
             self.look_at(*self.raster_to_geo(x, y))
             s = self.get_sample()
-            w = classifier.classify(s)
+            w = self.classifier.classify(s)
             if w < thresh:
                 print "Negative sample", w
                 break
@@ -378,21 +426,29 @@ class LabelerWindow(QtGui.QWidget):
         x, y = self.geo_x, self.geo_y
 
         def undo_positive():
-            classifier.positives.pop()
             self.look_at(x, y)
+            self.dataset.delete(self.get_sample(), label='positive')
+            self.classifier.positives.pop()
+            self.classifier.save()
 
         def undo_negative():
-            classifier.negatives.pop()
             self.look_at(x, y)
+            self.dataset.delete(self.get_sample(), label='negative')
+            self.classifier.negatives.pop()
+            self.classifier.save()
 
         if key == Qt.Key_X:
-            print "Mark Pos. ", self.ds.GetDescription(), self.geo_center()
-            classifier.add_positive(self.get_sample())
+            print "Mark Pos. ", self.raster.GetDescription(), self.geo_xy()
+            self.classifier.add_positive(self.get_sample())
+            self.dataset.create(self.get_sample(), label='positive', meta=dict(pos=self.geo_xy())).save()
+            self.classifier.save()
             undos.append(undo_positive)
             self.goto_next_sample()
         elif key == Qt.Key_C:
-            print "Mark Neg. ", self.ds.GetDescription(), self.geo_center()
-            classifier.add_negative(self.get_sample())
+            print "Mark Neg. ", self.raster.GetDescription(), self.geo_xy()
+            self.classifier.add_negative(self.get_sample())
+            self.dataset.create(self.get_sample(), label='negative', meta=dict(pos=self.geo_xy())).save()
+            self.classifier.save()
             undos.append(undo_negative)
             self.goto_next_sample()
         elif key == Qt.Key_Left:
@@ -410,9 +466,13 @@ class LabelerWindow(QtGui.QWidget):
             self.scale /= sqrt(2.)
             self.update_raster()
         elif key == Qt.Key_S:
-            classifier.save(file('training.pkl', 'wb'))
+            self.save_classifier()
+        elif key == Qt.Key_R:
+            self.classifier.rebuild(self.dataset)
+            self.save_classifier()
+            self.goto_next_sample()
         elif key == Qt.Key_L:
-            classifier.load(file('training.pkl', 'rb'))
+            self.load_classifier()
         elif key == Qt.Key_P:
             self.mode = MODE_POSITIVES
             self.goto_next_sample()
@@ -426,29 +486,32 @@ class LabelerWindow(QtGui.QWidget):
             s = self.get_sample()
             self.visualize_classification(s)
 
+    def save_classifier(self):
+        self.classifier.save(file('training.pkl', 'wb'))
+
     def visualize_classification(self, s):
         import pylab
-        i_p, w_p = classifier.find_similar_positive(s)
-        i_n, w_n = classifier.find_similar_negative(s)
+        i_p, w_p = self.classifier.find_similar_positive(s)
+        i_n, w_n = self.classifier.find_similar_negative(s)
         pylab.figure()
         pylab.subplot(231)
         if i_n >= 0:
-            pylab.imshow(classifier.negatives[i_n])
+            pylab.imshow(self.classifier.negatives[i_n])
         pylab.title('negative')
         pylab.subplot(232)
         pylab.imshow(s)
         pylab.title('query')
         pylab.subplot(233)
         if i_p >= 0:
-            pylab.imshow(classifier.positives[i_p])
+            pylab.imshow(self.classifier.positives[i_p])
         pylab.title('positive')
         pylab.subplot(234)
         if i_n >= 0:
-            pylab.imshow((abs(classifier.negatives[i_n].astype(float) - s) ** 2).mean(2), cmap=pylab.cm.gray,
+            pylab.imshow((abs(self.classifier.negatives[i_n].astype(float) - s) ** 2).mean(2), cmap=pylab.cm.gray,
                          vmax=255 ** 2)
         pylab.subplot(236)
         if i_p >= 0:
-            pylab.imshow((abs(classifier.positives[i_p].astype(float) - s) ** 2).mean(2), cmap=pylab.cm.gray,
+            pylab.imshow((abs(self.classifier.positives[i_p].astype(float) - s) ** 2).mean(2), cmap=pylab.cm.gray,
                          vmax=255 ** 2)
         pylab.show()
 
@@ -465,7 +528,6 @@ class LabelerWindow(QtGui.QWidget):
 
 
 
-
 if __name__ == '__main__':
     app = QApplication([])
     win = LabelerWindow()
@@ -473,7 +535,9 @@ if __name__ == '__main__':
     #URLS:   https://drive.google.com/open?id=0B8AGWB7NYzjXQjhkVm9iWFlUaU0
     #URLS:   https://drive.google.com/open?id=0B8AGWB7NYzjXQk5NTS1ibFJYM3c
 
-    win.open(r'D:\sf_building_footprints\201104_san_francisco_ca_0x3000m_utm_clr\north_up\10seg460805.tif')
+    win.open_raster(r'D:\sf_building_footprints\201104_san_francisco_ca_0x3000m_utm_clr\north_up\10seg460805.tif')
+    win.load_classifier()
+    win.look_at(*win.center_of_raster())
     win.goto_next_uncertain()
     win.show()
     app.exec_()
